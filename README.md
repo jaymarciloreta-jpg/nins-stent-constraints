@@ -4,7 +4,7 @@ Derives transnasal stent design constraints from CT sinus scans, in 3D Slicer, f
 
 > **v0.1.0. Not validated. Do not use these numbers in a deck, a filing, or a design freeze.**
 >
-> Tested on **one side of one scan**, with seeds placed by script rather than by a clinician. It has never been run against a deviated septum, concha bullosa, dental amalgam, or mucosal disease filling the airway. That last one is the failure mode that would most directly corrupt the headline number.
+> TIt has never been run against a deviated septum, concha bullosa, dental amalgam, or mucosal disease filling the airway. That last one is the failure mode that would most directly corrupt the headline number.
 >
 > This round exists to find out where it breaks. Failures are the useful output.
 
