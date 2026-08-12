@@ -5,7 +5,7 @@ tags: [skill, slicer, nins, device]
 
 How to run `nins_stent_constraints.py`, which turns a few seed clicks into the NINS stent design constraint table.
 
-**Version 0.1.0. .** That is exactly what this round is for: run it on real scans with real seeds and tell me where it breaks. Do not put these numbers in a deck yet.
+**Version 0.2.0.** That is exactly what this round is for: run it on real scans with real seeds and tell me where it breaks. Do not put these numbers in a deck yet.
 
 ## What question it answers
 

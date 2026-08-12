@@ -2,9 +2,9 @@
 
 Derives transnasal stent design constraints from CT sinus scans, in 3D Slicer, from **one seed click per side**.
 
-> **v0.1.0. Not validated. Do not use these numbers in a deck, a filing, or a design freeze.**
+> **v0.2.0. Not validated. Do not use these numbers in a deck, a filing, or a design freeze.**
 >
-> TIt has never been run against a deviated septum, concha bullosa, dental amalgam, or mucosal disease filling the airway. That last one is the failure mode that would most directly corrupt the headline number.
+> It has never been run against a deviated septum, concha bullosa, dental amalgam, or mucosal disease filling the airway. That last one is the failure mode that would most directly corrupt the headline number.
 >
 > This round exists to find out where it breaks. Failures are the useful output.
 
@@ -70,6 +70,8 @@ The working rule: **geometry automates, recognition does not, refinement does.**
 ## Requirements
 
 3D Slicer 5.6+ with its bundled Python (numpy, scipy, vtk). No external packages, no network, no deep learning.
+
+Thresholds self-calibrate per scan from its own histogram, and scans outside the method's competence are refused rather than measured. Run `test_calibration.py` to verify both.
 
 Runs in about 20 s on a cropped sinus CT, about 85 s on a full head, most of it the symmetry search.
 
