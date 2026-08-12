@@ -67,7 +67,7 @@ import vtk
 import slicer
 from scipy import ndimage
 
-SCRIPT_VERSION = "0.2.0"
+SCRIPT_VERSION = "0.3.0"
 
 # ---- tunables. Every uppercase global is captured into the provenance record.
 AIR_HU_MAX = -350.0          # airway lumen, mucosal surface
@@ -778,6 +778,7 @@ def corridor_profile(array, ijk_to_ras, ras_to_ijk, p_ant, p_post, spacing,
     binding = min(clean or stations, key=lambda s: s["mucosal_diam_mm"])
     return {"status": "ok",
             "corridor_length_mm": L,
+            "a_range": [float(p_ant[1]), float(p_post[1])],
             "n_stations": len(stations),
             "n_discontinuities": jumps,
             "profile_is_smooth": bool(jumps <= max(1, len(stations) // 20)),
@@ -848,6 +849,148 @@ def derive_corridor_endpoints(array, ijk_to_ras, ras_to_ijk, spf_centre,
             "p_post": np.array([x, float(post), ss]),
             "derived_length_mm": float(ant - post),
             "source": "derived from midline septal and maxillary edges"}
+
+
+def morphometrics(array, ijk_to_ras, ras_to_ijk, spacing, midline_x, yaw_deg,
+                  corridor_by_side, calib=None):
+    """Population morphometry, reported SEPARATELY from the device constraints.
+
+    These are descriptors of the anatomy, not dimensions a stent is designed
+    against, and they must not be read as design inputs. Everything here is
+    geometry on the symmetry frame plus calibrated tissue classes, which is the
+    class of measurement that tested clean.
+
+    Deliberately NOT included: named sinus volumes. Telling the maxillary sinus
+    from the ethmoid air cells is anatomical recognition, which has failed eight
+    times in this project. Total enclosed air per side is reported instead,
+    which is geometrically defined and means exactly what it says.
+    """
+    if midline_x is None:
+        return {"status": "no_midline",
+                "why": "every quantity here is defined against the midsagittal "
+                       "plane, so without a trustworthy one none of it is defined"}
+    air_max = _th(calib, "AIR_HU_MAX", AIR_HU_MAX)
+    dz, dy, dx = spacing[2], spacing[1], spacing[0]
+    voxel_mm3 = dx * dy * dz
+    K, J, I = array.shape
+
+    # RAS x of every column, so "which side" is a real question about geometry
+    cols = np.arange(I)
+    xs = (ijk_to_ras @ np.stack([cols, np.zeros_like(cols), np.zeros_like(cols),
+                                 np.ones_like(cols)]).astype(float))[0]
+    dist = xs - midline_x
+
+    out = {"status": "ok", "voxel_mm3": round(voxel_mm3, 5), "sides": {},
+           "caveat": ("descriptive morphometry, not device design inputs; "
+                      "no anatomical structure is named here because naming "
+                      "one requires recognition, which does not automate")}
+
+    air = array < air_max
+    rows = np.arange(J)
+    ys = (ijk_to_ras @ np.stack([np.zeros_like(rows), rows, np.zeros_like(rows),
+                                 np.ones_like(rows)]).astype(float))[1]
+
+    # ONE anterior-posterior extent for both sides. Measuring each side over
+    # whatever corridor happened to be available made the volumes
+    # incomparable: with a corridor on the right only, the left was integrated
+    # over the entire volume and the asymmetry ratio read 9.16x on a subject
+    # whose septum is nearly straight.
+    ranges = [c["a_range"] for c in (corridor_by_side or {}).values()
+              if c and c.get("status") == "ok" and c.get("a_range")]
+    if ranges:
+        a_lo = max(min(r) for r in ranges)          # intersection, so both
+        a_hi = min(max(r) for r in ranges)          # sides see the same span
+        band = (ys >= a_lo) & (ys <= a_hi)
+        extent = [round(float(a_lo), 1), round(float(a_hi), 1)]
+    else:
+        band = np.ones(J, dtype=bool)
+        extent = None
+    out["shared_a_extent_mm"] = extent
+    out["extent_note"] = ("both sides integrated over the same span, otherwise "
+                          "the asymmetry ratio is not a ratio of like things")
+
+    for side, sign in (("R", 1.0), ("L", -1.0)):
+        if extent is None:
+            # Without an anterior-posterior extent this integrates every air
+            # voxel near the midline, including the air around the head: it
+            # read 253 cm3 per side on a scan with no corridor, which is not a
+            # nasal airway by any reading. Refused rather than reported.
+            out["sides"][side] = {
+                "nasal_airway_volume_mm3": None,
+                "status": "needs_corridor",
+                "why": ("airway volume is only defined between the corridor "
+                        "endpoints; without them this would integrate the air "
+                        "around the head. Place piriform and choana seeds, or "
+                        "let them be derived from an SPF seed.")}
+            continue
+        ipsi = (dist * sign > 0) & (np.abs(dist) <= NASAL_HALF_WIDTH_MM)
+        mask = air & ipsi[None, None, :] & band[None, :, None]
+        vol = float(mask.sum()) * voxel_mm3
+        out["sides"][side] = {
+            "nasal_airway_volume_mm3": round(vol, 1),
+            "corridor_a_extent_mm": extent,
+            "definition": (f"enclosed air within {NASAL_HALF_WIDTH_MM:.0f} mm of "
+                           f"the midline on this side, between the corridor "
+                           f"endpoints")}
+
+    # Septal deviation. Measured per ROW, requiring a genuine non-air gap that
+    # spans the midline: that gap is the septum, whatever it is made of.
+    # Collapsing over height instead just asked "is there air near the midline",
+    # which answered 0.15 mm (a third of a voxel) on two different subjects.
+    near = np.abs(dist) <= NASAL_HALF_WIDTH_MM
+    near_cols = np.where(near)[0]
+    devs = []
+    if len(near_cols) > 4:
+        d_near = dist[near_cols]
+        order = np.argsort(d_near)
+        cols_sorted = near_cols[order]
+        d_sorted = d_near[order]
+        mid_k = int(np.searchsorted(d_sorted, 0.0))
+        j_step = max(1, J // 80)
+        k_step = max(1, K // 80)
+        for j in range(0, J, j_step):
+            if not band[j]:
+                continue
+            for k in range(0, K, k_step):
+                row = air[k, j, cols_sorted]
+                if not row.any():
+                    continue
+                left = np.where(row[:mid_k])[0]
+                right = np.where(row[mid_k:])[0]
+                if not (len(left) and len(right)):
+                    continue
+                l_edge = d_sorted[left[-1]]          # innermost air on the left
+                r_edge = d_sorted[mid_k + right[0]]  # innermost air on the right
+                gap = r_edge - l_edge
+                if gap < 0.5 or gap > 12.0:          # not a septum
+                    continue
+                if row[left[-1] + 1:mid_k + right[0]].any():
+                    continue                          # the gap is not solid
+                devs.append(float((l_edge + r_edge) / 2.0))
+    if devs:
+        devs = np.asarray(devs)
+        out["septal_deviation"] = {
+            "max_abs_mm": round(float(np.abs(devs).max()), 2),
+            "median_signed_mm": round(float(np.median(devs)), 2),
+            "p95_abs_mm": round(float(np.percentile(np.abs(devs), 95)), 2),
+            "toward": ("right" if np.median(devs) > 0 else "left"),
+            "n_rows": int(len(devs)),
+            "definition": ("signed offset from the symmetry plane of the centre "
+                           "of the solid tissue gap separating the two airways; "
+                           "positive is right")}
+    else:
+        out["septal_deviation"] = {"status": "no_septum_rows_found"}
+
+    r = out["sides"].get("R", {}).get("nasal_airway_volume_mm3")
+    l = out["sides"].get("L", {}).get("nasal_airway_volume_mm3")
+    if not (r and l):
+        out["airway_asymmetry"] = {"status": "needs_corridor"}
+    if r and l:
+        out["airway_asymmetry"] = {
+            "volume_ratio_larger_over_smaller": round(max(r, l) / max(min(r, l), 1e-9), 3),
+            "difference_mm3": round(abs(r - l), 1),
+            "larger_side": "R" if r > l else "L"}
+    return out
 
 
 # ------------------------------------------------------------------- driver
@@ -935,12 +1078,39 @@ def run(volume_node_name=None, write_json_dir=None, skip_symmetry=False):
                  if sym and sym.get("sharp_enough") else None)
 
     seeds = _seeds_in_scene()
+    # Seeds are scene-global, so a seed left over from a previously loaded
+    # volume will silently be used on this one. Reject any that fall outside
+    # this volume's bounds.
+    K0, J0, I0 = array.shape
+    outside = []
+    for key, pt in list(seeds.items()):
+        ijk = (R2I @ np.array([*pt, 1.0]))[:3]
+        if not (0 <= ijk[0] < I0 and 0 <= ijk[1] < J0 and 0 <= ijk[2] < K0):
+            outside.append(f"{key[0]}_{key[1]}")
+            del seeds[key]
+    if outside:
+        check("seeds_outside_volume", "error",
+              f"seed(s) {outside} lie outside {volume.GetName()} and were "
+              f"ignored. They are almost certainly left over from a different "
+              f"scan: markup nodes belong to the scene, not to a volume.")
     report["seeds_found"] = sorted(f"{r}_{s}" for (r, s) in seeds)
+    def _add_morphometrics(corridors):
+        try:
+            report["morphometrics"] = morphometrics(
+                array, M, R2I, spacing, midline_x,
+                (sym or {}).get("yaw_deg", 0.0), corridors, calib=calib)
+        except Exception as exc:
+            report["morphometrics"] = {"status": "error", "detail": str(exc)}
+            check("morphometrics_error", "warn", f"morphometry failed: {exc}")
+
     if not seeds:
         check("no_seeds", "error",
               "no seed fiducials found. Expected names like SPF_R, piriform_R, "
-              "choana_R. See the module docstring.")
+              "choana_R. See the module docstring. Descriptive morphometry is "
+              "still reported below: it needs only the midsagittal plane.")
+        _add_morphometrics({})
         report["status"] = "failed"
+        report["elapsed_s"] = round(time.time() - t0, 1)
         return report
 
     for side in ("R", "L"):
@@ -1054,6 +1224,11 @@ def run(volume_node_name=None, write_json_dir=None, skip_symmetry=False):
                 rec[f"{role}_clearance_mm"] = round(d, 3)
         report["sides"][side] = rec
 
+    # Morphometry last, and in its own block, so it can never be mistaken for
+    # a device constraint.
+    _add_morphometrics({sd: rec.get("corridor")
+                        for sd, rec in report["sides"].items()})
+
     report["status"] = "ok" if not any(
         c["severity"] == "error" for c in report["checks"]) else "failed"
     report["elapsed_s"] = round(time.time() - t0, 1)
@@ -1137,6 +1312,25 @@ def print_report(report):
             d = rec.get(f"{role}_clearance_mm")
             if d is not None:
                 print(f"    {role:<8} clearance {d:.2f} mm from the SPF centre")
+    mm = report.get("morphometrics") or {}
+    if mm.get("status") == "ok":
+        print()
+        print("  --- morphometry (descriptive, NOT device constraints) " + "-" * 14)
+        for sd, rec in mm.get("sides", {}).items():
+            v = rec.get("nasal_airway_volume_mm3")
+            print(f"    side {sd} airway volume  "
+                  + (f"{v:.0f} mm3" if v is not None
+                     else f"not available ({rec.get('status')})"))
+        sep = mm.get("septal_deviation")
+        if sep:
+            print(f"    septal deviation      {sep['max_abs_mm']:.2f} mm max, "
+                  f"median {sep['median_signed_mm']:+.2f} mm toward the {sep['toward']}")
+        asym = mm.get("airway_asymmetry")
+        if asym and asym.get("volume_ratio_larger_over_smaller"):
+            print(f"    airway asymmetry      {asym['volume_ratio_larger_over_smaller']:.2f}x, "
+                  f"{asym['larger_side']} larger")
+    elif mm:
+        print(f"\n  morphometry: {mm.get('status')}")
     if report.get("checks"):
         print()
         print("  checks:")
