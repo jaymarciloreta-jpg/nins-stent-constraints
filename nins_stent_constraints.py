@@ -67,7 +67,7 @@ import vtk
 import slicer
 from scipy import ndimage
 
-SCRIPT_VERSION = "0.1.0"
+SCRIPT_VERSION = "0.2.0"
 
 # ---- tunables. Every uppercase global is captured into the provenance record.
 AIR_HU_MAX = -350.0          # airway lumen, mucosal surface
@@ -91,6 +91,31 @@ AXIS_STEP_SEARCH_MM = 3.0    # how far the centreline may move per 1 mm station
 # Bounds for deriving the corridor endpoints, relative to the SPF centre.
 CORRIDOR_POST_SEARCH_MM = 30.0   # posterior septal edge lies within this of the SPF
 CORRIDOR_ANT_SEARCH_MM = 45.0    # anterior maxillary edge likewise
+
+# ---- self-calibration. Absolute HU thresholds hold only for a calibrated
+# MDCT on the kernel they were tuned on, and cone beam CT has no reliable HU
+# calibration at all. These derive the working thresholds from the volume's own
+# air and soft-tissue histogram modes instead, as fractions of their separation.
+CALIB_AIR_FRACTION = 0.55       # air ceiling, from the air mode toward soft
+CALIB_BONE_FRACTION = 0.30      # bone floor, from the soft mode upward
+CALIB_LUMEN_FRACTION = 0.16     # "not lumen" ceiling
+# 3 sigma, not 4. At 4 sigma on the reference scan this demanded 139 HU, which
+# stepped straight past a thin coronal SPF rim whose prominence sits between
+# 120 and 139, and the aperture jumped from 4.47 to 6.17 mm. Thin rims are the
+# known failure mode here: the posterior SPF rim partial-volumes down to about
+# 227 HU, which is why an absolute threshold was abandoned in the first place.
+CALIB_RIM_NOISE_SIGMA = 3.0     # a rim must clear this many noise SDs
+APERTURE_SENSITIVITY_TOL_MM = 0.5   # flag if +/-25% prominence moves it by more
+CALIB_RIM_MIN_FRACTION = 0.10   # and at least this fraction of the separation
+CALIB_MIN_SEPARATION_HU = 500.0 # below this the histogram is not usable
+
+# ---- competence gate. The failure mode on an out-of-scope scan is a plausible
+# number, not an error, so the tool has to know what it cannot do.
+GATE_VOXEL_WARN_MM = 0.6        # SPF aperture is about 3.6 mm across
+GATE_VOXEL_REFUSE_MM = 1.0      # below about 3.6 samples across, feret is noise
+GATE_METAL_HU = 3000.0          # saturated voxels
+GATE_METAL_REFUSE_FRACTION = 0.005  # coarse proxy: streak reaches far beyond the metal
+GATE_MIN_BONE_VOXELS = 5000
 
 SEED_ROLES = ("SPF", "piriform", "choana", "vidian", "FR")
 REQUIRED_SEEDS = ("SPF",)
@@ -146,6 +171,158 @@ def _profile(array, ras_to_ijk, origin, direction, length_mm, step_mm=0.1):
     t = np.arange(0.0, length_mm + 1e-9, step_mm)
     pts = np.asarray(origin, float)[None, :] + t[:, None] * direction[None, :]
     return t, _sample(array, ras_to_ijk, pts)
+
+
+def _th(calib, key, default):
+    """Calibrated threshold if available, otherwise the module default."""
+    v = (calib or {}).get(key)
+    return default if v is None else v
+
+
+def calibrate_intensities(array, sample_stride=3):
+    """Derive intensity thresholds from the volume's own histogram.
+
+    Every head CT has a large air population and a large soft-tissue
+    population. Locating those two modes fixes the intensity scale for this
+    scan, so the thresholds track the scanner, kernel and calibration instead
+    of being pinned to the one machine they were tuned on. On the reference
+    scan this recovers the hand-tuned values without being told them: air max
+    -430.8 against a hand-set -350, bone min 344.3 against 300, rim prominence
+    109.7 against 120.
+
+    Returns status "not_bimodal" when the two modes are not separated enough to
+    trust, which is the signature of an uncalibrated or truncated volume.
+    """
+    a = array[::sample_stride, ::sample_stride, ::sample_stride].ravel()
+
+    # Histogram over the volume's OWN range. Fixed HU bands would defeat the
+    # purpose: a +300 HU offset moves soft tissue out of any band pinned to
+    # standard calibration, which is exactly the cone beam case this exists
+    # for. Peaks are found by population, not by where they "should" be.
+    lo = float(np.percentile(a, 0.1))
+    hi = float(np.percentile(a, 99.9))
+    if hi - lo < CALIB_MIN_SEPARATION_HU:
+        return {"status": "not_bimodal",
+                "reason": f"intensity range is only {hi - lo:.0f} HU wide"}
+    hist, edges = np.histogram(a, bins=256, range=(lo, hi))
+    centres = (edges[:-1] + edges[1:]) / 2.0
+    smooth = np.convolve(hist, np.ones(5) / 5.0, mode="same")
+
+    # local maxima carrying a real population
+    floor = 0.02 * smooth.max()
+    peaks = [i for i in range(1, len(smooth) - 1)
+             if smooth[i] >= smooth[i - 1] and smooth[i] > smooth[i + 1]
+             and smooth[i] > floor]
+    if len(peaks) < 2:
+        return {"status": "not_bimodal",
+                "reason": f"only {len(peaks)} intensity mode(s) found; a head CT "
+                          f"should show distinct air and soft tissue populations"}
+    # Air is the LOWEST major mode: nothing in a head is less dense than air.
+    # Soft tissue is then the largest mode sufficiently above it.
+    #
+    # An earlier rule, "the two largest well separated peaks", inverted the
+    # whole intensity scale on any phantom where bone is plentiful: it paired
+    # soft tissue as air and bone as soft tissue, because those two are the
+    # largest populations. Largest is not the discriminator. Lowest is.
+    air_i = min(peaks, key=lambda i: centres[i])
+    above = [i for i in peaks
+             if centres[i] - centres[air_i] >= CALIB_MIN_SEPARATION_HU]
+    if not above:
+        return {"status": "not_bimodal",
+                "air_mode_hu": float(centres[air_i]),
+                "reason": f"no intensity mode more than "
+                          f"{CALIB_MIN_SEPARATION_HU:.0f} HU above the air mode"}
+    soft_i = max(above, key=lambda i: smooth[i])
+    air_mode, soft_mode = float(centres[air_i]), float(centres[soft_i])
+    sep = soft_mode - air_mode
+
+    # Noise from the soft tissue peak, re-banded so a wide peak is not clipped.
+    # A fixed +/- 60 HU band under-reported sigma 80 as 41.
+    sigma, half = 0.0, 0.12 * sep
+    for _ in range(3):
+        band = a[(a > soft_mode - half) & (a < soft_mode + half)]
+        if band.size < 100:
+            break
+        sigma = float(np.percentile(band, 75) - np.percentile(band, 25)) / 1.349
+        half = max(0.06 * sep, 3.0 * sigma)
+    return {"status": "ok",
+            "air_mode_hu": air_mode, "soft_mode_hu": soft_mode,
+            "separation_hu": float(sep), "noise_sd_hu": sigma,
+            "AIR_HU_MAX": air_mode + CALIB_AIR_FRACTION * sep,
+            "BONE_HU_MIN": soft_mode + CALIB_BONE_FRACTION * sep,
+            "LUMEN_HU_MAX": soft_mode + CALIB_LUMEN_FRACTION * sep,
+            "RIM_PROMINENCE_HU": max(CALIB_RIM_NOISE_SIGMA * sigma,
+                                     CALIB_RIM_MIN_FRACTION * sep)}
+
+
+def assess_competence(volume_node, array, calib):
+    """Decide whether this scan is inside the tool's competence.
+
+    Returns status refused, marginal or ok, with the reasons. A refusal is a
+    success: the alternative is a plausible-looking number from a scan the
+    method cannot support.
+    """
+    spacing = list(volume_node.GetSpacing())
+    reasons, warnings, checks = [], [], {}
+
+    worst = max(spacing)
+    checks["voxel_mm"] = [round(s, 3) for s in spacing]
+    checks["samples_across_spf"] = round(3.63 / worst, 2)
+    if worst > GATE_VOXEL_REFUSE_MM:
+        reasons.append(
+            f"voxel size {worst:.2f} mm gives only {3.63 / worst:.1f} samples "
+            f"across a 3.6 mm SPF aperture; sub-voxel aperture measurement is "
+            f"not supportable above {GATE_VOXEL_REFUSE_MM} mm")
+    elif worst > GATE_VOXEL_WARN_MM:
+        warnings.append(
+            f"voxel size {worst:.2f} mm is coarser than the {GATE_VOXEL_WARN_MM} mm "
+            f"this method was characterised at; apertures will be less precise")
+
+    if calib.get("status") != "ok":
+        reasons.append(f"intensity calibration failed: {calib.get('reason')}. "
+                       f"Thresholds cannot be derived for this volume.")
+        checks["calibration"] = calib.get("status")
+    else:
+        checks["calibration"] = "ok"
+        checks["separation_hu"] = round(calib["separation_hu"], 1)
+        checks["noise_sd_hu"] = round(calib["noise_sd_hu"], 1)
+        if calib["noise_sd_hu"] > 0.08 * calib["separation_hu"]:
+            warnings.append(
+                f"soft tissue noise {calib['noise_sd_hu']:.0f} HU is high "
+                f"relative to tissue contrast; edges will be less reliable")
+
+        bone = array > calib["BONE_HU_MIN"]
+        n_bone = int(bone.sum())
+        checks["bone_voxels"] = n_bone
+        if n_bone < GATE_MIN_BONE_VOXELS:
+            reasons.append(f"only {n_bone} bone voxels; too little bone for the "
+                           f"symmetry search to find a midsagittal plane")
+        else:
+            # symmetry needs bone on both sides of the volume's own centre
+            xs = bone.sum(axis=(0, 1))
+            half = len(xs) // 2
+            l, r = int(xs[:half].sum()), int(xs[half:].sum())
+            bal = min(l, r) / max(max(l, r), 1)
+            checks["bone_lateral_balance"] = round(bal, 3)
+            if bal < 0.25:
+                warnings.append(
+                    f"bone is markedly one-sided in this volume (balance "
+                    f"{bal:.2f}); the symmetry midline may be unreliable, "
+                    f"usually a sign the field of view is cropped off centre")
+
+    metal = float((array >= GATE_METAL_HU).mean())
+    checks["metal_saturated_fraction"] = round(metal, 5)
+    if metal > GATE_METAL_REFUSE_FRACTION:
+        reasons.append(f"{metal * 100:.1f}% of voxels are saturated at or above "
+                       f"{GATE_METAL_HU:.0f} HU; streak artefact will corrupt "
+                       f"edge positions")
+    elif metal > GATE_METAL_REFUSE_FRACTION / 4:
+        warnings.append(f"{metal * 100:.2f}% saturated voxels; check for streak "
+                        f"artefact near the measurement planes")
+
+    status = "refused" if reasons else ("marginal" if warnings else "ok")
+    return {"status": status, "refusals": reasons, "warnings": warnings,
+            "checks": checks}
 
 
 # ------------------------------------------------- midsagittal by symmetry
@@ -232,11 +409,19 @@ def _lumen_baseline(array, ras_to_ijk, seed, radius_mm=0.6):
 def _rim_distance(array, ras_to_ijk, origin, direction, baseline,
                   prominence=RIM_PROMINENCE_HU, search_mm=RIM_SEARCH_MM):
     t, hu = _profile(array, ras_to_ijk, origin, direction, search_mm)
+    # The FIRST rim that clears prominence, not the highest one along the ray.
+    # Taking the highest walked straight past a weak inner margin to whatever
+    # denser bone lay behind it, over-reporting the aperture: on a phantom with
+    # a 165 HU inner rim at 2 mm and a 900 HU outer rim at 3 mm it returned
+    # 6.41 mm instead of 4 mm, at every prominence setting. A foramen is
+    # bounded by the first margin outward, whatever sits behind it.
     peak = None
     for i in range(1, len(hu)):
-        if hu[i] - baseline >= prominence and (peak is None or hu[i] > hu[peak]):
-            peak = i
-        elif peak is not None and hu[i] < baseline + 0.3 * prominence:
+        if hu[i] - baseline >= prominence:
+            j = i
+            while j + 1 < len(hu) and hu[j + 1] > hu[j]:
+                j += 1
+            peak = j
             break
     if peak is None:
         return None
@@ -249,7 +434,7 @@ def _rim_distance(array, ras_to_ijk, origin, direction, baseline,
 
 
 def min_feret_aperture(array, ras_to_ijk, seed, plane="axial",
-                       n_angles=FERET_N_ANGLES):
+                       n_angles=FERET_N_ANGLES, calib=None):
     """Narrowest rim-to-rim aperture through `seed`, over all in-plane angles.
 
     Takes ONE seed and no direction, so the operator's angle cannot influence
@@ -263,7 +448,7 @@ def min_feret_aperture(array, ras_to_ijk, seed, plane="axial",
     """
     seed = np.asarray(seed, float)
     baseline = _lumen_baseline(array, ras_to_ijk, seed)
-    if baseline is None or baseline >= LUMEN_HU_MAX:
+    if baseline is None or baseline >= _th(calib, "LUMEN_HU_MAX", LUMEN_HU_MAX):
         return {"status": "seed_not_in_lumen", "baseline_hu": baseline}
     best = None
     for ang in np.linspace(0.0, np.pi, int(n_angles), endpoint=False):
@@ -273,8 +458,9 @@ def min_feret_aperture(array, ras_to_ijk, seed, plane="axial",
             u = np.array([np.cos(ang), 0.0, np.sin(ang)])
         else:
             u = np.array([0.0, np.cos(ang), np.sin(ang)])
-        dp = _rim_distance(array, ras_to_ijk, seed, u, baseline)
-        dn = _rim_distance(array, ras_to_ijk, seed, -u, baseline)
+        prom = _th(calib, "RIM_PROMINENCE_HU", RIM_PROMINENCE_HU)
+        dp = _rim_distance(array, ras_to_ijk, seed, u, baseline, prom)
+        dn = _rim_distance(array, ras_to_ijk, seed, -u, baseline, prom)
         if dp is None or dn is None:
             continue
         total = dp + dn
@@ -285,14 +471,49 @@ def min_feret_aperture(array, ras_to_ijk, seed, plane="axial",
                     "p2_ras": (seed - u * dn).tolist()}
     if best is None:
         return {"status": "no_bounded_direction", "baseline_hu": baseline}
-    best.update({"status": "ok", "plane": plane, "baseline_hu": baseline})
+    best.update({"status": "ok", "plane": plane, "baseline_hu": baseline,
+                 "prominence_hu": prom})
     return best
 
 
-def spf_centre(array, ras_to_ijk, seed):
+def aperture_with_stability(array, ras_to_ijk, seed, plane="axial", calib=None,
+                            tol_mm=APERTURE_SENSITIVITY_TOL_MM):
+    """Minimum feret plus a check that it does not hinge on the threshold.
+
+    Re-measures at +/-25% rim prominence. If the answer moves by more than
+    tol_mm the aperture is sitting on a detection cliff, which happens when a
+    rim is thin enough to be marginal against noise. On the reference scan the
+    coronal SPF aperture reads 4.47 mm at 120 HU and 6.17 mm at 139 HU, so the
+    number alone would look perfectly reasonable and be threshold-determined.
+    Reported, not silently resolved: the tool cannot know which rim is real.
+    """
+    base = min_feret_aperture(array, ras_to_ijk, seed, plane=plane, calib=calib)
+    if base.get("status") != "ok":
+        return base
+    prom = base["prominence_hu"]
+    alts = []
+    for scale in (0.75, 1.25):
+        c = dict(calib or {})
+        c["RIM_PROMINENCE_HU"] = prom * scale
+        r = min_feret_aperture(array, ras_to_ijk, seed, plane=plane, calib=c)
+        if r.get("status") == "ok":
+            alts.append(r["aperture_mm"])
+    if alts:
+        spread = max(max(alts), base["aperture_mm"]) - min(min(alts),
+                                                           base["aperture_mm"])
+        base["threshold_spread_mm"] = float(spread)
+        base["threshold_sensitive"] = bool(spread > tol_mm)
+        base["aperture_at_prominence"] = {
+            f"{prom * 0.75:.0f}": round(alts[0], 3),
+            f"{prom:.0f}": round(base["aperture_mm"], 3),
+            f"{prom * 1.25:.0f}": (round(alts[1], 3) if len(alts) > 1 else None)}
+    return base
+
+
+def spf_centre(array, ras_to_ijk, seed, calib=None):
     """SPF centre and both apertures from one seed."""
-    ax = min_feret_aperture(array, ras_to_ijk, seed, plane="axial")
-    co = min_feret_aperture(array, ras_to_ijk, seed, plane="coronal")
+    ax = aperture_with_stability(array, ras_to_ijk, seed, plane="axial", calib=calib)
+    co = aperture_with_stability(array, ras_to_ijk, seed, plane="coronal", calib=calib)
     if ax.get("status") != "ok" or co.get("status") != "ok":
         return {"status": "aperture_failed", "axial": ax, "coronal": co}
     centre = (np.array(ax["p1_ras"]) + np.array(ax["p2_ras"])
@@ -300,6 +521,8 @@ def spf_centre(array, ras_to_ijk, seed):
     return {"status": "ok", "centre_ras": centre.tolist(),
             "aperture_axial_mm": ax["aperture_mm"],
             "aperture_coronal_mm": co["aperture_mm"],
+            "aperture_threshold_sensitive": bool(ax.get("threshold_sensitive")
+                                                 or co.get("threshold_sensitive")),
             "shift_from_seed_mm": float(np.linalg.norm(centre - np.asarray(seed, float))),
             "axial": ax, "coronal": co}
 
@@ -309,7 +532,7 @@ def spf_centre(array, ras_to_ijk, seed):
 def lumen_at_coronal(array, ijk_to_ras, ras_to_ijk, seed_ras, spacing,
                      target_ras=None, midline_x=None, side_sign=None,
                      prev_mask=None, prev_axis_ki=None,
-                     axis_search_mm=AXIS_STEP_SEARCH_MM):
+                     axis_search_mm=AXIS_STEP_SEARCH_MM, calib=None):
     """Mucosal and bony cross section on the coronal plane through `seed_ras`.
 
     Mucosal: the enclosed airway component containing the seed. Components
@@ -330,7 +553,7 @@ def lumen_at_coronal(array, ijk_to_ras, ras_to_ijk, seed_ras, spacing,
     sl = array[:, j, :]                       # [k, i] = [S, R]
     dz, dx = spacing[2], spacing[0]
 
-    air = sl < AIR_HU_MAX
+    air = sl < _th(calib, "AIR_HU_MAX", AIR_HU_MAX)
 
     # Restrict to the ipsilateral side of the midline. Without this the two
     # nasal cavities merge, inferiorly and through the choana, into one
@@ -436,7 +659,7 @@ def lumen_at_coronal(array, ijk_to_ras, ras_to_ijk, seed_ras, spacing,
     for ang in np.linspace(0, 2 * np.pi, BONY_N_RAYS, endpoint=False):
         u = np.array([np.cos(ang), 0.0, np.sin(ang)])
         t, hu = _profile(array, ras_to_ijk, cen_ras, u, 40.0)
-        hit = np.where(hu >= BONE_HU_MIN)[0]
+        hit = np.where(hu >= _th(calib, "BONE_HU_MIN", BONE_HU_MIN))[0]
         rays.append(float(t[hit[0]]) if len(hit) else np.nan)
     rays = np.array(rays)
     if np.isfinite(rays).sum() >= BONY_N_RAYS * 0.8:
@@ -458,7 +681,8 @@ def lumen_at_coronal(array, ijk_to_ras, ras_to_ijk, seed_ras, spacing,
 
 
 def corridor_profile(array, ijk_to_ras, ras_to_ijk, p_ant, p_post, spacing,
-                     step_mm=PROFILE_STEP_MM, midline_x=None, side_sign=None):
+                     step_mm=PROFILE_STEP_MM, midline_x=None, side_sign=None,
+                     calib=None):
     """Lumen cross section every step_mm from the piriform seed to the choana seed.
 
     Sampling the corridor continuously rather than at named anatomical stations
@@ -478,7 +702,8 @@ def corridor_profile(array, ijk_to_ras, ras_to_ijk, p_ant, p_post, spacing,
         p = p_ant + u * t
         r = lumen_at_coronal(array, ijk_to_ras, ras_to_ijk, p, spacing,
                              midline_x=midline_x, side_sign=side_sign,
-                             prev_mask=prev_mask, prev_axis_ki=prev_axis)
+                             prev_mask=prev_mask, prev_axis_ki=prev_axis,
+                             calib=calib)
         if r.get("status") == "ok":
             prev_mask = r.pop("_mask", None)
             prev_axis = r.get("axis_ki")
@@ -522,7 +747,7 @@ def corridor_profile(array, ijk_to_ras, ras_to_ijk, p_ant, p_post, spacing,
 
 
 def derive_corridor_endpoints(array, ijk_to_ras, ras_to_ijk, spf_centre,
-                              midline_x, yaw_deg, side_sign):
+                              midline_x, yaw_deg, side_sign, calib=None):
     """Corridor endpoints from the two structures that sit in the midline.
 
     Per Dr. Iloreta: the posterior edge of the septum and the anterior edge of
@@ -555,7 +780,8 @@ def derive_corridor_endpoints(array, ijk_to_ras, ras_to_ijk, spf_centre,
             xs = midline_x + ty * (a_mm - sa) + dx
             pts = np.stack([np.full_like(svals, xs),
                             np.full_like(svals, a_mm), svals], axis=-1)
-            if (_sample(array, ras_to_ijk, pts) > BONE_HU_MIN).any():
+            if (_sample(array, ras_to_ijk, pts)
+                    > _th(calib, "BONE_HU_MIN", BONE_HU_MIN)).any():
                 return True
         return False
 
@@ -631,8 +857,25 @@ def run(volume_node_name=None, write_json_dir=None, skip_symmetry=False):
     array, M, R2I = _volume_arrays(volume)
     spacing = volume.GetSpacing()
 
+    # Calibrate to this volume, then decide whether the scan is inside the
+    # tool's competence. A refusal here is the point of the gate: on an
+    # out-of-scope scan the failure mode is a plausible number, not an error.
+    calib = calibrate_intensities(array)
+    report["calibration"] = calib
+    gate = assess_competence(volume, array, calib)
+    report["competence"] = gate
+    for w in gate["warnings"]:
+        check("competence_marginal", "warn", w)
+    if gate["status"] == "refused":
+        for r in gate["refusals"]:
+            check("competence_refused", "error", r)
+        report["status"] = "refused"
+        report["elapsed_s"] = round(time.time() - t0, 1)
+        return report
+
     if not skip_symmetry:
-        sym = find_midsagittal(array, M)
+        sym = find_midsagittal(array, M,
+                               bone_hu=_th(calib, "BONE_HU_MIN", SYMMETRY_BONE_HU))
         report["midsagittal"] = sym
         if sym is None:
             check("symmetry_failed", "warn", "no bone found for symmetry search")
@@ -665,13 +908,23 @@ def run(volume_node_name=None, write_json_dir=None, skip_symmetry=False):
                   f"side {side} has seeds but no SPF_{side}; the headline "
                   f"conduction gap cannot be computed")
         else:
-            sc = spf_centre(array, R2I, spf_seed)
+            sc = spf_centre(array, R2I, spf_seed, calib=calib)
             rec["spf"] = sc
             if sc["status"] != "ok":
                 check(f"spf_aperture_{side}", "error",
                       f"SPF_{side}: {sc['status']}. Re-place the seed well "
                       f"inside the foramen lumen.")
             else:
+                for pl in ("axial", "coronal"):
+                    a = sc[pl]
+                    if a.get("threshold_sensitive"):
+                        check(f"aperture_threshold_sensitive_{pl}_{side}", "warn",
+                              f"side {side}: the {pl} SPF aperture moves "
+                              f"{a['threshold_spread_mm']:.2f} mm when the rim "
+                              f"prominence is varied by +/-25% "
+                              f"({a['aperture_at_prominence']}). A rim here is "
+                              f"marginal against image noise, so this aperture "
+                              f"is threshold-determined. Confirm it by eye.")
                 if sc["shift_from_seed_mm"] > 3.0:
                     check(f"spf_centre_moved_{side}", "warn",
                           f"SPF_{side} centre sits {sc['shift_from_seed_mm']:.2f} mm "
@@ -680,7 +933,8 @@ def run(volume_node_name=None, write_json_dir=None, skip_symmetry=False):
                 lum = lumen_at_coronal(array, M, R2I, sc["centre_ras"], spacing,
                                        target_ras=sc["centre_ras"],
                                        midline_x=midline_x,
-                                       side_sign=(1.0 if side == "R" else -1.0))
+                                       side_sign=(1.0 if side == "R" else -1.0),
+                                       calib=calib)
                 lum.pop("_mask", None)
                 rec["spf_station"] = lum
                 if lum.get("status") == "ok" and "surface_to_target_mm" in lum:
@@ -703,7 +957,7 @@ def run(volume_node_name=None, write_json_dir=None, skip_symmetry=False):
             der = derive_corridor_endpoints(
                 array, M, R2I, rec["spf"]["centre_ras"], midline_x,
                 (sym or {}).get("yaw_deg", 0.0),
-                1.0 if side == "R" else -1.0)
+                1.0 if side == "R" else -1.0, calib=calib)
             if der is not None:
                 pir = pir if pir is not None else der["p_ant"]
                 cho = cho if cho is not None else der["p_post"]
@@ -728,7 +982,7 @@ def run(volume_node_name=None, write_json_dir=None, skip_symmetry=False):
                 rec["corridor"] = corridor_profile(
                     array, M, R2I, pir, cho, spacing,
                     midline_x=midline_x,
-                    side_sign=(1.0 if side == "R" else -1.0))
+                    side_sign=(1.0 if side == "R" else -1.0), calib=calib)
                 cor = rec["corridor"]
                 if cor.get("status") != "ok":
                     check(f"corridor_{side}", "warn",
@@ -779,6 +1033,23 @@ def print_report(report):
     print(f"  volume:  {report.get('volume', {}).get('name')}")
     print(f"  config:  {report.get('config_hash')}   "
           f"{report.get('elapsed_s')} s")
+    cal = report.get("calibration", {})
+    if cal.get("status") == "ok":
+        print(f"  calib:   air {cal['air_mode_hu']:.0f} / soft "
+              f"{cal['soft_mode_hu']:.0f} HU, noise {cal['noise_sd_hu']:.0f}"
+              f"  ->  air<{cal['AIR_HU_MAX']:.0f}  bone>{cal['BONE_HU_MIN']:.0f}"
+              f"  rim>{cal['RIM_PROMINENCE_HU']:.0f}")
+    elif cal:
+        print(f"  calib:   FAILED ({cal.get('reason')})")
+    gate = report.get("competence", {})
+    if gate:
+        vx = gate["checks"].get("voxel_mm")
+        print(f"  scan:    {gate['status'].upper()}   voxel {vx}"
+              f"   {gate['checks'].get('samples_across_spf')} samples across the SPF")
+        for r in gate.get("refusals", []):
+            print(f"           REFUSED: {r}")
+        for w in gate.get("warnings", []):
+            print(f"           marginal: {w}")
     print(f"  seeds:   {', '.join(report.get('seeds_found', [])) or 'none'}")
     sym = report.get("midsagittal")
     if sym:
@@ -790,8 +1061,10 @@ def print_report(report):
         print(f"  --- side {side} " + "-" * 52)
         spf = rec.get("spf", {})
         if spf.get("status") == "ok":
+            warn = "  [THRESHOLD-SENSITIVE]" if spf.get(
+                "aperture_threshold_sensitive") else ""
             print(f"    SPF aperture      axial {spf['aperture_axial_mm']:.2f} mm"
-                  f"   coronal {spf['aperture_coronal_mm']:.2f} mm")
+                  f"   coronal {spf['aperture_coronal_mm']:.2f} mm{warn}")
         gap = rec.get("conduction_gap_mm")
         if gap is not None:
             verdict = "WITHIN" if rec.get("within_budget") else "OVER"
@@ -830,4 +1103,5 @@ def print_report(report):
 print(f"(C) NINS_Stent_Constraints_0811.py v{SCRIPT_VERSION} loaded. "
       f"Nothing has run yet.")
 print(f"  Seeds expected: " + ", ".join(f"{r}_R/{r}_L" for r in SEED_ROLES))
+print("  Thresholds self-calibrate per scan; scans outside competence are refused.")
 print(f"  Run:  report = run(); print_report(report)")
