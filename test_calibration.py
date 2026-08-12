@@ -161,6 +161,36 @@ check("  and its bone floor sits above soft tissue, not below it",
       cb["status"] == "ok" and cb["BONE_HU_MIN"] > cb["soft_mode_hu"],
       f"bone floor {cb.get('BONE_HU_MIN', 0):.0f} HU")
 
+# Regression, found on the second real subject: many reconstructions pad
+# outside the field of view with -2000 or -3024 HU. That padding is a huge
+# discrete population, so it became the "air" mode and shifted every class down
+# one: air read -2977, soft tissue -969, and the bone floor came out at -367 HU,
+# calling 32% of the volume bone. The gate passed it as merely "marginal".
+padded = head_phantom()
+padded[:12] = -3024.0
+padded[-12:] = -3024.0
+cp = calibrate(padded)
+check("out-of-FOV padding does not become the air mode",
+      cp["status"] == "ok" and cp["air_mode_hu"] < -500.0
+      and -100.0 < cp["soft_mode_hu"] < 300.0,
+      f"air {cp.get('air_mode_hu', 0):.0f}, soft {cp.get('soft_mode_hu', 0):.0f} HU")
+check("  the padded fraction is reported",
+      cp.get("padding_fraction", 0) > 0.15,
+      f"{cp.get('padding_fraction', 0) * 100:.0f}% of voxels below the air floor")
+check("  and the bone floor stays physical",
+      cp["status"] == "ok" and cp["BONE_HU_MIN"] > 100.0,
+      f"{cp.get('BONE_HU_MIN', 0):.0f} HU")
+
+# The plausibility backstop, independent of where the padding came from.
+absurd = np.full((60, 60, 60), 800.0, dtype=np.float32)
+absurd[:20] = -1000.0
+absurd[20:26] = 40.0          # a small soft-tissue population, so it IS bimodal
+absurd += np.random.default_rng(1).normal(0, 15.0, absurd.shape).astype(np.float32)
+ca = calibrate(absurd)
+check("a bone floor that would call most of the volume bone is refused",
+      ca["status"] == "not_bimodal" and "not credible" in ca.get("reason", ""),
+      ca.get("reason", "")[:60])
+
 flat = np.full((60, 60, 60), 30.0, dtype=np.float32)
 cf = calibrate(flat)
 check("a volume with no air population is refused, not guessed",

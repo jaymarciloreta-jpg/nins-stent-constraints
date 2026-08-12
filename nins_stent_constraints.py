@@ -108,6 +108,23 @@ CALIB_RIM_NOISE_SIGMA = 3.0     # a rim must clear this many noise SDs
 APERTURE_SENSITIVITY_TOL_MM = 0.5   # flag if +/-25% prominence moves it by more
 CALIB_RIM_MIN_FRACTION = 0.10   # and at least this fraction of the separation
 CALIB_MIN_SEPARATION_HU = 500.0 # below this the histogram is not usable
+# Nothing real is less dense than air. Many reconstructions pad outside the
+# field of view with -2000 or -3024, and that padding is a huge discrete
+# population: on the second subject tested it became the "air" mode and shifted
+# every class down one, giving a bone floor of -367 HU that called 32% of the
+# volume bone, while still reporting status ok.
+# Padding is a SPIKE at the extreme low value with a gap above it. Detecting it
+# that way is calibration independent; a fixed floor is not, and would strip
+# legitimate air from an offset or cone beam scan.
+CALIB_PAD_MIN_FRACTION = 0.005   # a spike must hold at least this much
+CALIB_PAD_MIN_GAP_HU = 300.0     # and sit this far below the next population
+# A head CT always contains bone, and never mostly bone. Both bounds matter:
+# the ceiling catches the padding inversion (which calls ~90% of the head bone)
+# and the floor catches the opposite inversion, where stripping a delta-shaped
+# air population leaves soft tissue reading as air and bone as soft tissue, so
+# the derived bone floor sits above everything and finds no bone at all.
+CALIB_MIN_BONE_FRACTION = 0.02
+CALIB_MAX_BONE_FRACTION = 0.55
 
 # ---- competence gate. The failure mode on an out-of-scope scan is a plausible
 # number, not an error, so the tool has to know what it cannot do.
@@ -193,66 +210,94 @@ def calibrate_intensities(array, sample_stride=3):
     Returns status "not_bimodal" when the two modes are not separated enough to
     trust, which is the signature of an uncalibrated or truncated volume.
     """
-    a = array[::sample_stride, ::sample_stride, ::sample_stride].ravel()
+    full = array[::sample_stride, ::sample_stride, ::sample_stride].ravel()
 
-    # Histogram over the volume's OWN range. Fixed HU bands would defeat the
-    # purpose: a +300 HU offset moves soft tissue out of any band pinned to
-    # standard calibration, which is exactly the cone beam case this exists
-    # for. Peaks are found by population, not by where they "should" be.
-    lo = float(np.percentile(a, 0.1))
-    hi = float(np.percentile(a, 99.9))
-    if hi - lo < CALIB_MIN_SEPARATION_HU:
-        return {"status": "not_bimodal",
-                "reason": f"intensity range is only {hi - lo:.0f} HU wide"}
-    hist, edges = np.histogram(a, bins=256, range=(lo, hi))
-    centres = (edges[:-1] + edges[1:]) / 2.0
-    smooth = np.convolve(hist, np.ones(5) / 5.0, mode="same")
+    def _fit(a):
+        """Locate the air and soft tissue modes in one candidate sample."""
+        lo, hi = float(np.percentile(a, 0.1)), float(np.percentile(a, 99.9))
+        if hi - lo < CALIB_MIN_SEPARATION_HU:
+            return {"status": "not_bimodal",
+                    "reason": f"intensity range is only {hi - lo:.0f} HU wide"}
+        hist, edges = np.histogram(a, bins=256, range=(lo, hi))
+        centres = (edges[:-1] + edges[1:]) / 2.0
+        smooth = np.convolve(hist, np.ones(5) / 5.0, mode="same")
+        # Pad the ends so a mode sitting in the first or last bin is still a
+        # local maximum. Without this, a population at the extreme of the
+        # histogram range is simply invisible to the peak search.
+        floor = 0.02 * smooth.max()
+        padded = np.concatenate(([0.0], smooth, [0.0]))
+        peaks = [i - 1 for i in range(1, len(padded) - 1)
+                 if padded[i] >= padded[i - 1] and padded[i] > padded[i + 1]
+                 and padded[i] > floor]
+        if len(peaks) < 2:
+            return {"status": "not_bimodal",
+                    "reason": f"only {len(peaks)} intensity mode(s) found; a head "
+                              f"CT should show distinct air and soft tissue "
+                              f"populations"}
+        # Air is the LOWEST major mode: nothing in a head is less dense than
+        # air. "The two largest peaks" is the wrong rule and inverted the whole
+        # scale whenever bone was plentiful.
+        air_i = min(peaks, key=lambda i: centres[i])
+        above = [i for i in peaks
+                 if centres[i] - centres[air_i] >= CALIB_MIN_SEPARATION_HU]
+        if not above:
+            return {"status": "not_bimodal",
+                    "reason": f"no intensity mode more than "
+                              f"{CALIB_MIN_SEPARATION_HU:.0f} HU above the air mode"}
+        soft_i = max(above, key=lambda i: smooth[i])
+        air_mode, soft_mode = float(centres[air_i]), float(centres[soft_i])
+        sep = soft_mode - air_mode
+        bone_min = soft_mode + CALIB_BONE_FRACTION * sep
+        head = a[a > air_mode + CALIB_AIR_FRACTION * sep]
+        bone_fraction = float((head > bone_min).mean()) if head.size else 1.0
+        if not (CALIB_MIN_BONE_FRACTION <= bone_fraction
+                <= CALIB_MAX_BONE_FRACTION):
+            return {"status": "not_bimodal", "air_mode_hu": air_mode,
+                    "soft_mode_hu": soft_mode, "separation_hu": float(sep),
+                    "bone_fraction": bone_fraction,
+                    "reason": f"the derived bone floor of {bone_min:.0f} HU would "
+                              f"call {bone_fraction * 100:.0f}% of the head bone, "
+                              f"which is not credible for a head CT; the "
+                              f"intensity modes have probably been misidentified"}
+        sigma, half = 0.0, 0.12 * sep
+        for _ in range(3):
+            band = a[(a > soft_mode - half) & (a < soft_mode + half)]
+            if band.size < 100:
+                break
+            sigma = float(np.percentile(band, 75)
+                          - np.percentile(band, 25)) / 1.349
+            half = max(0.06 * sep, 3.0 * sigma)
+        return {"status": "ok", "bone_fraction": bone_fraction,
+                "air_mode_hu": air_mode, "soft_mode_hu": soft_mode,
+                "separation_hu": float(sep), "noise_sd_hu": sigma,
+                "AIR_HU_MAX": air_mode + CALIB_AIR_FRACTION * sep,
+                "BONE_HU_MIN": bone_min,
+                "LUMEN_HU_MAX": soft_mode + CALIB_LUMEN_FRACTION * sep,
+                "RIM_PROMINENCE_HU": max(CALIB_RIM_NOISE_SIGMA * sigma,
+                                         CALIB_RIM_MIN_FRACTION * sep)}
 
-    # local maxima carrying a real population
-    floor = 0.02 * smooth.max()
-    peaks = [i for i in range(1, len(smooth) - 1)
-             if smooth[i] >= smooth[i - 1] and smooth[i] > smooth[i + 1]
-             and smooth[i] > floor]
-    if len(peaks) < 2:
-        return {"status": "not_bimodal",
-                "reason": f"only {len(peaks)} intensity mode(s) found; a head CT "
-                          f"should show distinct air and soft tissue populations"}
-    # Air is the LOWEST major mode: nothing in a head is less dense than air.
-    # Soft tissue is then the largest mode sufficiently above it.
-    #
-    # An earlier rule, "the two largest well separated peaks", inverted the
-    # whole intensity scale on any phantom where bone is plentiful: it paired
-    # soft tissue as air and bone as soft tissue, because those two are the
-    # largest populations. Largest is not the discriminator. Lowest is.
-    air_i = min(peaks, key=lambda i: centres[i])
-    above = [i for i in peaks
-             if centres[i] - centres[air_i] >= CALIB_MIN_SEPARATION_HU]
-    if not above:
-        return {"status": "not_bimodal",
-                "air_mode_hu": float(centres[air_i]),
-                "reason": f"no intensity mode more than "
-                          f"{CALIB_MIN_SEPARATION_HU:.0f} HU above the air mode"}
-    soft_i = max(above, key=lambda i: smooth[i])
-    air_mode, soft_mode = float(centres[air_i]), float(centres[soft_i])
-    sep = soft_mode - air_mode
+    # Out-of-FOV padding is a discrete spike at the low extreme with a gap above
+    # it. On the second real subject tested, 20% of the volume was -3024 padding;
+    # it became the "air" mode and shifted every class down one, giving a bone
+    # floor of -367 HU while still reporting status ok. Both interpretations are
+    # tried and the plausible one wins, because in a noiseless phantom true air
+    # is also a spike with a gap, so the spike alone cannot decide it.
+    candidates = [(full, 0.0)]
+    vmin = float(full.min())
+    spike = full <= vmin + 1.0
+    if spike.mean() >= CALIB_PAD_MIN_FRACTION:
+        rest = full[~spike]
+        if rest.size and float(rest.min()) - vmin >= CALIB_PAD_MIN_GAP_HU:
+            candidates.insert(0, (rest, float(spike.mean())))
 
-    # Noise from the soft tissue peak, re-banded so a wide peak is not clipped.
-    # A fixed +/- 60 HU band under-reported sigma 80 as 41.
-    sigma, half = 0.0, 0.12 * sep
-    for _ in range(3):
-        band = a[(a > soft_mode - half) & (a < soft_mode + half)]
-        if band.size < 100:
-            break
-        sigma = float(np.percentile(band, 75) - np.percentile(band, 25)) / 1.349
-        half = max(0.06 * sep, 3.0 * sigma)
-    return {"status": "ok",
-            "air_mode_hu": air_mode, "soft_mode_hu": soft_mode,
-            "separation_hu": float(sep), "noise_sd_hu": sigma,
-            "AIR_HU_MAX": air_mode + CALIB_AIR_FRACTION * sep,
-            "BONE_HU_MIN": soft_mode + CALIB_BONE_FRACTION * sep,
-            "LUMEN_HU_MAX": soft_mode + CALIB_LUMEN_FRACTION * sep,
-            "RIM_PROMINENCE_HU": max(CALIB_RIM_NOISE_SIGMA * sigma,
-                                     CALIB_RIM_MIN_FRACTION * sep)}
+    last = None
+    for sample, pad in candidates:
+        res = _fit(sample)
+        last = res if last is None else last
+        if res.get("status") == "ok":
+            res["padding_fraction"] = pad
+            return res
+    return last
 
 
 def assess_competence(volume_node, array, calib):
