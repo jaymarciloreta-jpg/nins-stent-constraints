@@ -4,6 +4,8 @@ Version 0.4.0 is the setup-case implementation. It connects source review, refer
 
 ![NINS Pilot panel with generated synthetic geometry](images/pilot-panel-synthetic.png)
 
+New to segmentation? The [Reading the Mask course](teaching/README.md) explains the methods behind each panel step and includes a practice walk-through of the synthetic demonstration.
+
 ## Install and start
 
 1. Clone or download the whole repository. Keep its `NINSPilot` and `scripts` folders together.
